@@ -968,17 +968,16 @@ class AppleMailConnector:
             account: Mail.app account name (e.g. "iCloud", "Gmail").
 
         Returns:
-            Tuple of (host, port, email). `email` is the first entry of
-            Mail.app's `email addresses` list if non-empty, else falls back
-            to the `user name` property.
+            Tuple of (host, port, email). `email` is Mail.app's `user name`
+            property — the username Mail.app itself uses for IMAP LOGIN —
+            falling back to `email_addresses[0]` only if `user name` is
+            empty.
 
-            For iCloud specifically, `user name` is the Apple ID login
-            identifier — which may be any email (e.g. a Gmail address) —
-            while the IMAP server only accepts @icloud.com / @me.com aliases
-            as LOGIN username. `email addresses` reliably contains the
-            alias iCloud's IMAP server expects. For Gmail / Yahoo / generic
-            IMAP accounts, the first email address typically equals
-            `user name`, so the behavior is equivalent there.
+            For custom-domain Apple IDs (e.g. `appleid@fmasi.eu`), iCloud
+            IMAP accepts only the Apple ID itself as LOGIN; the SMTP From
+            aliases in `email addresses` are rejected. Using `user name`
+            mirrors Mail.app's own credential and works across iCloud,
+            Gmail, Yahoo, and generic IMAP accounts.
 
         Raises:
             MailAccountNotFoundError: If the account doesn't exist.
@@ -996,7 +995,8 @@ class AppleMailConnector:
         raw = self._run_applescript(script)
         parsed = cast(dict[str, Any], parse_applescript_json(raw))
         email_addresses = cast(list[str], parsed.get("email_addresses") or [])
-        email = email_addresses[0] if email_addresses else cast(str, parsed["user_name"])
+        user_name = cast(str, parsed.get("user_name") or "")
+        email = user_name or (email_addresses[0] if email_addresses else "")
         return (
             cast(str, parsed["host"]),
             cast(int, parsed["port"]),
