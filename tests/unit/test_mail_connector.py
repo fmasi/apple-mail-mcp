@@ -5179,6 +5179,120 @@ class TestCreateDraft:
                 seed="reply", seed_id="999999", body="x"
             )
 
+    # ------------------------------------------------------------------
+    # RFC 5322 Message-ID seed_id support
+    #
+    # Since #148 (dual-emit), read tools (search_messages, get_messages)
+    # surface the RFC Message-ID in the `id` field on IMAP-backed rows.
+    # Agents loop that id straight back as `reply_to`/`forward_of`. The
+    # AppleScript `whose id is "..."` clause matches Mail's INTERNAL
+    # numeric id, not the RFC Message-ID, so without translation the
+    # lookup never matches.
+    #
+    # Discriminator: RFC Message-IDs always contain '@'; Mail's internal
+    # ids are integer strings with no '@'. When seed_id contains '@',
+    # resolve via find_message_by_message_id (the same resolver
+    # update_draft already uses for In-Reply-To recovery) before
+    # building the AppleScript.
+    # ------------------------------------------------------------------
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    @patch.object(AppleMailConnector, "find_message_by_message_id")
+    def test_reply_with_rfc_message_id_resolves_to_internal_id(
+        self,
+        mock_resolve: MagicMock,
+        mock_run: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        """An RFC Message-ID (contains '@') must be resolved to Mail's
+        internal numeric id before being embedded in `whose id is`."""
+        rfc_id = "ABC123@LOVP265MB8807.GBRP265.PROD.OUTLOOK.COM"
+        mock_resolve.return_value = "555777"
+        mock_run.return_value = "1"
+
+        connector.create_draft(
+            seed="reply",
+            seed_id=rfc_id,
+            body="thanks",
+        )
+
+        mock_resolve.assert_called_once_with(rfc_id)
+        script = mock_run.call_args[0][0]
+        assert 'whose id is "555777"' in script
+        assert rfc_id not in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    @patch.object(AppleMailConnector, "find_message_by_message_id")
+    def test_forward_with_rfc_message_id_resolves_to_internal_id(
+        self,
+        mock_resolve: MagicMock,
+        mock_run: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        """Forward path has the same bug class as reply — covered here."""
+        rfc_id = "XYZ987@mail.example.com"
+        mock_resolve.return_value = "888999"
+        mock_run.return_value = "1"
+
+        connector.create_draft(
+            seed="forward",
+            seed_id=rfc_id,
+            to=["dest@example.com"],
+            body="fyi",
+        )
+
+        mock_resolve.assert_called_once_with(rfc_id)
+        script = mock_run.call_args[0][0]
+        assert 'whose id is "888999"' in script
+        assert rfc_id not in script
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    @patch.object(AppleMailConnector, "find_message_by_message_id")
+    def test_reply_with_unresolvable_rfc_message_id_raises(
+        self,
+        mock_resolve: MagicMock,
+        mock_run: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        """When find_message_by_message_id returns None (no such message),
+        surface a clean MailMessageNotFoundError without ever calling
+        _run_applescript for the draft creation."""
+        rfc_id = "missing@example.com"
+        mock_resolve.return_value = None
+
+        with pytest.raises(MailMessageNotFoundError):
+            connector.create_draft(
+                seed="reply",
+                seed_id=rfc_id,
+                body="x",
+            )
+
+        mock_resolve.assert_called_once_with(rfc_id)
+        mock_run.assert_not_called()
+
+    @patch.object(AppleMailConnector, "_run_applescript")
+    @patch.object(AppleMailConnector, "find_message_by_message_id")
+    def test_reply_with_numeric_id_skips_message_id_resolver(
+        self,
+        mock_resolve: MagicMock,
+        mock_run: MagicMock,
+        connector: AppleMailConnector,
+    ) -> None:
+        """Legacy numeric ids (no '@') must NOT round-trip through the
+        message-id resolver — preserves the existing fast path and
+        avoids an unnecessary AppleScript call."""
+        mock_run.return_value = "1"
+
+        connector.create_draft(
+            seed="reply",
+            seed_id="160989",
+            body="thanks",
+        )
+
+        mock_resolve.assert_not_called()
+        script = mock_run.call_args[0][0]
+        assert 'whose id is "160989"' in script
+
 
 class TestExtractDraftAttachments:
     """Tests for AppleMailConnector.extract_draft_attachments."""

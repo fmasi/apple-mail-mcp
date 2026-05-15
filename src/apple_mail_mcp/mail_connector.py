@@ -3288,6 +3288,42 @@ class AppleMailConnector:
             return None
         return result
 
+    def _translate_rfc_seed_id(self, seed_id: str | None) -> str | None:
+        """Translate an RFC 5322 Message-ID seed to Mail's internal id.
+
+        Since #148, read tools (search_messages, get_messages) emit the
+        RFC Message-ID in the ``id`` field on IMAP-backed rows. Agents
+        loop that value straight back as ``reply_to``/``forward_of``,
+        but the AppleScript ``whose id is`` clause matches only Mail's
+        internal numeric keyspace — without translation, the lookup
+        misses and surfaces as SEED_NOT_FOUND.
+
+        Discriminator: RFC Message-IDs contain ``@``; internal ids
+        don't. This is the same heuristic ``update_draft`` already
+        relies on when recovering a reply seed from a saved draft's
+        ``In-Reply-To`` header.
+
+        Args:
+            seed_id: caller-supplied seed id (RFC or internal form), or
+                None for the ``seed='new'`` path.
+
+        Returns:
+            ``seed_id`` unchanged if None or internal (no ``@``);
+            otherwise the resolved internal numeric id.
+
+        Raises:
+            MailMessageNotFoundError: ``seed_id`` is an RFC Message-ID
+                with no matching message in any mailbox.
+        """
+        if seed_id is None or "@" not in seed_id:
+            return seed_id
+        resolved = self.find_message_by_message_id(seed_id)
+        if resolved is None:
+            raise MailMessageNotFoundError(
+                f"no message with id {seed_id!r}"
+            )
+        return resolved
+
     def get_draft_state(self, draft_id: str) -> dict[str, Any]:
         """Read recipients, subject, body, threading headers, and
         attachment names from a saved draft.
@@ -3470,6 +3506,7 @@ class AppleMailConnector:
             if subject is not None
             else None
         )
+        seed_id = self._translate_rfc_seed_id(seed_id)
         seed_id_safe = (
             escape_applescript_string(sanitize_input(seed_id))
             if seed_id is not None
