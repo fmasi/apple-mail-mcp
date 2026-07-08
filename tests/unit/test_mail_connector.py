@@ -1,6 +1,7 @@
 """Unit tests for mail connector."""
 
 import logging
+import smtplib
 import time
 import warnings
 from pathlib import Path
@@ -21,6 +22,7 @@ from apple_mail_fast_mcp.exceptions import (
     MailKeychainEntryNotFoundError,
     MailMailboxNotFoundError,
     MailMessageNotFoundError,
+    MailSafetyError,
 )
 from apple_mail_fast_mcp.mail_connector import (
     AppleMailConnector,
@@ -8096,3 +8098,371 @@ class TestSyncAccountDrafts:
                 from_account="iCloud",
             )
         assert result["draft_id"] == "<m@h>"
+
+
+class TestSmtpSendPath:
+    """#322: create_draft(send_now=True) submits a wrapper-free RFC 822
+    message over SMTP, bypassing Mail.app's AppleScript
+    ``tell theMessage to send`` (whose ``content`` setter applies the
+    FB11734014 cite-blockquote to sent mail). The SMTP boundary is
+    ``mail_connector.SmtpSender``.
+    """
+
+    @pytest.fixture
+    def connector(self) -> AppleMailConnector:
+        return AppleMailConnector(timeout=30)
+
+    def _configure_smtp(
+        self,
+        connector: AppleMailConnector,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        host: str = "smtp.x.test",
+        port: int = 587,
+        email: str = "me@x.test",
+        password: str = "pw",
+    ) -> None:
+        """Wire the connector so the SMTP path engages without real I/O."""
+        monkeypatch.setattr(
+            connector, "_resolve_smtp_config", lambda account: (host, port, email)
+        )
+        monkeypatch.setattr(
+            connector,
+            "_resolve_imap_config",
+            lambda account: ("imap.x.test", 993, email),
+        )
+        monkeypatch.setattr(
+            connector,
+            "_get_imap_password_with_fallback",
+            lambda account, e: password,
+        )
+        monkeypatch.setattr(
+            connector, "_resolve_account_to_sender", lambda account: email
+        )
+        monkeypatch.setattr(connector, "_imap_breaker_open", lambda account: False)
+        monkeypatch.setattr(connector, "_imap_clear_breaker", lambda account: None)
+
+    # --- the bug regression -------------------------------------------------
+
+    def test_send_now_compose_uses_smtp_not_applescript(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression for #322: with SMTP configured, a fresh send_now is
+        submitted over SMTP as a clean (no cite-blockquote) message and the
+        AppleScript ``tell theMessage to send`` path is never reached."""
+        self._configure_smtp(connector, monkeypatch)
+        scripts: list[str] = []
+        monkeypatch.setattr(
+            connector, "_run_applescript", lambda s: scripts.append(s) or ""
+        )
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            result = connector.create_draft(
+                seed="new",
+                to=["a@example.com"],
+                subject="Hi",
+                body="Hello there",
+                from_account="Gmail",
+                send_now=True,
+            )
+
+        assert not any("tell theMessage to send" in s for s in scripts)
+        sender_cls.assert_called_once()
+        sender_cls.return_value.send.assert_called_once()
+        raw, recipients = sender_cls.return_value.send.call_args.args
+        assert b"Hello there" in raw
+        assert b"blockquote" not in raw.lower()  # FB11734014 wrapper absent
+        assert recipients == ["a@example.com"]
+        assert result == {
+            "draft_id": "",
+            "sent_message_id": "",
+            "from_account": "Gmail",
+        }
+
+    def test_send_now_compose_includes_cc_and_bcc_in_envelope(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._configure_smtp(connector, monkeypatch)
+        monkeypatch.setattr(connector, "_run_applescript", lambda s: "")
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            connector.create_draft(
+                seed="new",
+                to=["a@example.com"],
+                cc=["c@example.net"],
+                bcc=["b@example.org"],
+                subject="Hi",
+                body="x",
+                from_account="Gmail",
+                send_now=True,
+            )
+        _raw, recipients = sender_cls.return_value.send.call_args.args
+        assert recipients == ["a@example.com", "c@example.net", "b@example.org"]
+
+    # --- graceful fallback --------------------------------------------------
+
+    def test_smtp_not_configured_falls_back_to_applescript(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            connector, "_resolve_smtp_config", lambda account: ("", 0, "")
+        )
+        monkeypatch.setattr(connector, "_imap_breaker_open", lambda account: False)
+        monkeypatch.setattr(
+            connector, "_resolve_account_to_sender", lambda account: "me@x.test"
+        )
+        scripts: list[str] = []
+        monkeypatch.setattr(
+            connector, "_run_applescript", lambda s: scripts.append(s) or "SENT"
+        )
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            connector.create_draft(
+                seed="new",
+                to=["a@example.com"],
+                subject="Hi",
+                body="x",
+                from_account="Gmail",
+                send_now=True,
+            )
+        sender_cls.assert_not_called()
+        assert any("tell theMessage to send" in s for s in scripts)
+
+    def test_smtp_failure_falls_back_to_applescript(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._configure_smtp(connector, monkeypatch)
+        scripts: list[str] = []
+        monkeypatch.setattr(
+            connector, "_run_applescript", lambda s: scripts.append(s) or "SENT"
+        )
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            sender_cls.return_value.send.side_effect = (
+                smtplib.SMTPAuthenticationError(535, b"bad creds")
+            )
+            connector.create_draft(
+                seed="new",
+                to=["a@example.com"],
+                subject="Hi",
+                body="x",
+                from_account="Gmail",
+                send_now=True,
+            )
+        assert any("tell theMessage to send" in s for s in scripts)
+
+    def test_keychain_miss_falls_back_to_applescript(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._configure_smtp(connector, monkeypatch)
+
+        def _raise(account: str, email: str) -> str:
+            raise MailKeychainEntryNotFoundError("no opt-in")
+
+        monkeypatch.setattr(
+            connector, "_get_imap_password_with_fallback", _raise
+        )
+        scripts: list[str] = []
+        monkeypatch.setattr(
+            connector, "_run_applescript", lambda s: scripts.append(s) or "SENT"
+        )
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            connector.create_draft(
+                seed="new",
+                to=["a@example.com"],
+                subject="Hi",
+                body="x",
+                from_account="Gmail",
+                send_now=True,
+            )
+        sender_cls.assert_not_called()
+        assert any("tell theMessage to send" in s for s in scripts)
+
+    # --- non-engagement -----------------------------------------------------
+
+    def test_try_smtp_send_returns_none_when_not_send_now(
+        self, connector: AppleMailConnector
+    ) -> None:
+        assert (
+            connector._try_smtp_send(
+                seed="new", seed_id=None, seed_mailbox=None, send_now=False,
+                from_account="Gmail", to=["a@example.com"], cc=None, bcc=None,
+                subject="Hi", body="x", reply_all=False, attachment_paths=None,
+            )
+            is None
+        )
+
+    def test_try_smtp_send_returns_none_without_account(
+        self, connector: AppleMailConnector
+    ) -> None:
+        assert (
+            connector._try_smtp_send(
+                seed="new", seed_id=None, seed_mailbox=None, send_now=True,
+                from_account=None, to=["a@example.com"], cc=None, bcc=None,
+                subject="Hi", body="x", reply_all=False, attachment_paths=None,
+            )
+            is None
+        )
+
+    def test_try_smtp_send_returns_none_for_non_rfc_reply_seed(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(connector, "_imap_breaker_open", lambda account: False)
+        # A numeric Mail id (no "@") can't be fetched over IMAP → fall through.
+        assert (
+            connector._try_smtp_send(
+                seed="reply", seed_id="12345", seed_mailbox="INBOX",
+                send_now=True, from_account="Gmail", to=None, cc=None, bcc=None,
+                subject=None, body="x", reply_all=False, attachment_paths=None,
+            )
+            is None
+        )
+
+    # --- reply / forward send ----------------------------------------------
+
+    def test_reply_send_via_smtp_uses_derived_recipients(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._configure_smtp(connector, monkeypatch)
+        monkeypatch.setattr(
+            connector,
+            "_build_reply_forward_mime",
+            lambda **kw: ("<m@id>", b"rawreply", ["orig@example.net"]),
+        )
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            result = connector._try_smtp_send(
+                seed="reply", seed_id="orig@id", seed_mailbox="INBOX",
+                send_now=True, from_account="Gmail", to=None, cc=None, bcc=None,
+                subject=None, body="thanks", reply_all=False, attachment_paths=None,
+            )
+        sender_cls.return_value.send.assert_called_once_with(
+            b"rawreply", ["orig@example.net"]
+        )
+        assert result == {"draft_id": "", "sent_message_id": ""}
+
+    def test_reply_forward_folder_miss_falls_back(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._configure_smtp(connector, monkeypatch)
+
+        def _miss(**kw: object) -> object:
+            raise MailMessageNotFoundError("not in folder")
+
+        monkeypatch.setattr(connector, "_build_reply_forward_mime", _miss)
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            result = connector._try_smtp_send(
+                seed="reply", seed_id="orig@id", seed_mailbox="Archive",
+                send_now=True, from_account="Gmail", to=None, cc=None, bcc=None,
+                subject=None, body="x", reply_all=False, attachment_paths=None,
+            )
+        assert result is None
+        sender_cls.assert_not_called()
+
+    # --- test-mode transport-boundary safety guard (#322 / #175) -----------
+
+    def test_test_mode_blocks_non_reserved_recipient(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setattr(
+            connector, "_get_imap_password_with_fallback", lambda a, e: "pw"
+        )
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            with pytest.raises(MailSafetyError):
+                connector._smtp_send(
+                    "Gmail",
+                    b"raw",
+                    ["real@person.com"],
+                    smtp_config=("smtp.x", 587, "me@x.test"),
+                )
+        sender_cls.assert_not_called()
+
+    def test_test_mode_allows_reserved_recipient(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        monkeypatch.setattr(
+            connector, "_get_imap_password_with_fallback", lambda a, e: "pw"
+        )
+        monkeypatch.setattr(connector, "_imap_clear_breaker", lambda a: None)
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            connector._smtp_send(
+                "Gmail",
+                b"raw",
+                ["ok@example.com"],
+                smtp_config=("smtp.x", 587, "me@x.test"),
+            )
+        sender_cls.return_value.send.assert_called_once_with(
+            b"raw", ["ok@example.com"]
+        )
+
+    def test_test_mode_blocks_derived_reply_all_recipient(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#175/#322: reply_all derives cc from the original — a real derived
+        recipient the server-layer gate never saw must be caught at the
+        transport boundary, and must NOT silently fall back to AppleScript."""
+        monkeypatch.setenv("MAIL_TEST_MODE", "true")
+        self._configure_smtp(connector, monkeypatch)
+        monkeypatch.setattr(
+            connector,
+            "_build_reply_forward_mime",
+            lambda **kw: (
+                "<m@id>",
+                b"raw",
+                ["ok@example.com", "boss@real-company.com"],
+            ),
+        )
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender") as sender_cls:
+            with pytest.raises(MailSafetyError):
+                connector._try_smtp_send(
+                    seed="reply", seed_id="orig@id", seed_mailbox="INBOX",
+                    send_now=True, from_account="Gmail", to=["ok@example.com"],
+                    cc=None, bcc=None, subject=None, body="hi", reply_all=True,
+                    attachment_paths=None,
+                )
+        sender_cls.assert_not_called()
+
+    # --- config discovery ---------------------------------------------------
+
+    def test_query_smtp_server_parses_host_port(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            connector,
+            "_run_applescript",
+            lambda s: '{"host":"smtp.mail.me.com","port":587}',
+        )
+        assert connector._query_smtp_server("iCloud") == ("smtp.mail.me.com", 587)
+
+    def test_query_smtp_server_missing_server_returns_empty(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            connector, "_run_applescript", lambda s: '{"host":"","port":0}'
+        )
+        assert connector._query_smtp_server("iCloud") == ("", 0)
+
+    def test_query_smtp_server_unparseable_returns_empty(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(connector, "_run_applescript", lambda s: "not-json")
+        assert connector._query_smtp_server("iCloud") == ("", 0)
+
+    def test_resolve_smtp_config_defaults_missing_port_to_587(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(connector, "_query_smtp_server", lambda a: ("smtp.x", 0))
+        monkeypatch.setattr(
+            connector, "_resolve_imap_config", lambda a: ("imap.x", 993, "me@x")
+        )
+        assert connector._resolve_smtp_config("Gmail") == ("smtp.x", 587, "me@x")
+
+    def test_resolve_smtp_config_unconfigured_short_circuits(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(connector, "_query_smtp_server", lambda a: ("", 0))
+        called: list[str] = []
+        monkeypatch.setattr(
+            connector,
+            "_resolve_imap_config",
+            lambda a: called.append(a) or ("h", 1, "e"),
+        )
+        assert connector._resolve_smtp_config("Gmail") == ("", 0, "")
+        assert called == []
