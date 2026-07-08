@@ -8247,6 +8247,48 @@ class TestSmtpSendPath:
             )
         assert any("tell theMessage to send" in s for s in scripts)
 
+    def test_non_221_quit_after_accept_does_not_double_send(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PR #404: if the server accepts the message (send_message → 250) but
+        then returns a non-221 to QUIT, ``SMTP.__exit__`` raises
+        ``SMTPResponseException``. That teardown error must NOT propagate into
+        an AppleScript fallback — otherwise a second copy is sent. Uses a real
+        ``SmtpSender`` over a mocked ``smtplib`` so the whole send path (not
+        just a mocked SmtpSender) is exercised.
+        """
+        self._configure_smtp(connector, monkeypatch)
+        scripts: list[str] = []
+        monkeypatch.setattr(
+            connector, "_run_applescript", lambda s: scripts.append(s) or "SENT"
+        )
+        with patch(
+            "apple_mail_fast_mcp.smtp_sender.smtplib.SMTP"
+        ) as mock_smtp:
+            client = mock_smtp.return_value.__enter__.return_value
+            # send_message succeeds (message accepted); QUIT on `with` exit
+            # returns non-221, which SMTP.__exit__ raises.
+            mock_smtp.return_value.__exit__.side_effect = (
+                smtplib.SMTPResponseException(421, b"4.7.0 try later")
+            )
+            result = connector.create_draft(
+                seed="new",
+                to=["a@example.com"],
+                subject="Hi",
+                body="Hello there",
+                from_account="Gmail",
+                send_now=True,
+            )
+
+        # Exactly one real SMTP submission, and no AppleScript duplicate.
+        client.send_message.assert_called_once()
+        assert not any("tell theMessage to send" in s for s in scripts)
+        assert result == {
+            "draft_id": "",
+            "sent_message_id": "",
+            "from_account": "Gmail",
+        }
+
     def test_keychain_miss_falls_back_to_applescript(
         self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
     ) -> None:
