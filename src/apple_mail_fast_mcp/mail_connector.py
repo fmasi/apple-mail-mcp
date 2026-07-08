@@ -5211,6 +5211,7 @@ class AppleMailConnector:
         recipients = list(to) + list(cc or []) + list(bcc or [])
         self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
         self._imap_clear_breaker(from_account)
+        self._save_sent_copy(from_account, raw, answered=False)
         return {"draft_id": "", "sent_message_id": ""}
 
     def _send_reply_forward_via_smtp(
@@ -5254,7 +5255,74 @@ class AppleMailConnector:
         )
         self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
         self._imap_clear_breaker(from_account)
+        # Reuse the connector already built for the original fetch — a reply
+        # carries \\Answered in Sent.
+        self._save_sent_copy(
+            from_account, raw, answered=(seed == "reply"), imap=imap
+        )
         return {"draft_id": "", "sent_message_id": ""}
+
+    def _save_sent_copy(
+        self,
+        from_account: str,
+        raw_message: bytes,
+        *,
+        answered: bool,
+        imap: ImapConnector | None = None,
+    ) -> None:
+        """Best-effort: APPEND a copy of a just-SMTP-sent message to the
+        account's Sent folder over IMAP (issue #406).
+
+        The SMTP send path (#322) submits directly via ``smtplib`` and so
+        loses the Sent-mailbox copy that Mail.app's AppleScript ``tell
+        theMessage to send`` used to save as a side effect. This restores it,
+        reusing the IMAP-APPEND infrastructure of the clean draft path
+        (#245/#246/#292) via :meth:`ImapConnector.append_sent_copy`.
+
+        Failure boundary (deliberate): by the time this runs the message has
+        already been accepted by the server and delivered to the recipient —
+        the send has *succeeded*. Any failure here (no Sent folder, IMAP
+        error, missing Keychain opt-in) is therefore logged and swallowed,
+        never raised. In particular it must never propagate into
+        :meth:`_try_smtp_send`'s fallback ``except`` clauses, because that
+        would drop through to the AppleScript ``tell theMessage to send`` path
+        and deliver a *second* copy — the exact duplicate-send class of bug
+        fixed for QUIT teardown in PR #404. Catching ``Exception`` broadly is
+        the intent: nothing about saving a courtesy copy may affect the send
+        outcome the caller already committed to.
+
+        Args:
+            from_account: Mail.app account whose Sent folder receives the copy.
+            raw_message: The exact bytes submitted over SMTP (still carrying
+                any ``Bcc`` header, which the Sent copy legitimately records).
+            answered: True when the sent message was a reply (adds
+                ``\\Answered`` to the Sent copy).
+            imap: An existing connector for ``from_account`` to reuse (the
+                reply/forward path already built one to fetch the original);
+                ``None`` means build one from the account's resolved config.
+        """
+        try:
+            if imap is None:
+                host, port, email = self._resolve_imap_config(from_account)
+                password = self._get_imap_password_with_fallback(
+                    from_account, email
+                )
+                imap = ImapConnector(
+                    host, port, email, password, pool=self._imap_pool
+                )
+            folder = imap.append_sent_copy(raw_message, answered=answered)
+            logger.debug(
+                "Saved Sent copy to %r for account %r", folder, from_account
+            )
+        except Exception as exc:  # best-effort — must never fail the send
+            logger.warning(
+                "SMTP send for account %r succeeded but saving a "
+                "Sent-mailbox copy failed; the message was delivered, so not "
+                "retrying (a retry could duplicate the send). Cause: %s",
+                from_account,
+                exc,
+                exc_info=True,
+            )
 
     def _try_clean_create_or_send(
         self,

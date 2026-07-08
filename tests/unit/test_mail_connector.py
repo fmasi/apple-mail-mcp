@@ -8112,7 +8112,7 @@ class TestSmtpSendPath:
     def connector(self) -> AppleMailConnector:
         return AppleMailConnector(timeout=30)
 
-    def _configure_smtp(
+    def _configure_smtp_without_sent_stub(
         self,
         connector: AppleMailConnector,
         monkeypatch: pytest.MonkeyPatch,
@@ -8122,7 +8122,9 @@ class TestSmtpSendPath:
         email: str = "me@x.test",
         password: str = "pw",
     ) -> None:
-        """Wire the connector so the SMTP path engages without real I/O."""
+        """Wire the connector so the SMTP path engages without real I/O,
+        leaving ``_save_sent_copy`` real so the Sent-copy behavior (#406) can
+        be exercised (with ``ImapConnector`` patched at the class boundary)."""
         monkeypatch.setattr(
             connector, "_resolve_smtp_config", lambda account: (host, port, email)
         )
@@ -8141,6 +8143,31 @@ class TestSmtpSendPath:
         )
         monkeypatch.setattr(connector, "_imap_breaker_open", lambda account: False)
         monkeypatch.setattr(connector, "_imap_clear_breaker", lambda account: None)
+
+    def _configure_smtp(
+        self,
+        connector: AppleMailConnector,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        host: str = "smtp.x.test",
+        port: int = 587,
+        email: str = "me@x.test",
+        password: str = "pw",
+    ) -> None:
+        """Wire the connector so the SMTP path engages without real I/O.
+
+        These transport tests assert on the SMTP submission, not the
+        post-send Sent-mailbox copy (#406), which would otherwise attempt
+        real IMAP I/O — so ``_save_sent_copy`` is stubbed. The Sent-copy
+        behavior has its own dedicated coverage (see the ``#406`` tests,
+        which use :meth:`_configure_smtp_without_sent_stub`)."""
+        self._configure_smtp_without_sent_stub(
+            connector, monkeypatch,
+            host=host, port=port, email=email, password=password,
+        )
+        monkeypatch.setattr(
+            connector, "_save_sent_copy", lambda *a, **k: None
+        )
 
     # --- the bug regression -------------------------------------------------
 
@@ -8395,6 +8422,113 @@ class TestSmtpSendPath:
             )
         assert result is None
         sender_cls.assert_not_called()
+
+    # --- Sent-mailbox copy after a successful send (#406) -------------------
+
+    def test_compose_send_saves_sent_copy(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#406: a successful compose send APPENDs a copy to the account's
+        Sent folder over IMAP (not marked as a reply)."""
+        self._configure_smtp_without_sent_stub(connector, monkeypatch)
+        monkeypatch.setattr(connector, "_run_applescript", lambda s: "")
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender"), patch(
+            "apple_mail_fast_mcp.mail_connector.ImapConnector"
+        ) as imap_cls:
+            connector.create_draft(
+                seed="new",
+                to=["a@example.com"],
+                subject="Hi",
+                body="Hello there",
+                from_account="Gmail",
+                send_now=True,
+            )
+        imap_cls.return_value.append_sent_copy.assert_called_once()
+        _args, kwargs = imap_cls.return_value.append_sent_copy.call_args
+        assert kwargs.get("answered") is False
+
+    def test_reply_send_saves_sent_copy_marked_answered(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#406: a reply send saves an \\Answered Sent copy, reusing the
+        connector already built to fetch the original."""
+        self._configure_smtp_without_sent_stub(connector, monkeypatch)
+        monkeypatch.setattr(
+            connector,
+            "_build_reply_forward_mime",
+            lambda **kw: ("<m@id>", b"rawreply", ["orig@example.net"]),
+        )
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender"), patch(
+            "apple_mail_fast_mcp.mail_connector.ImapConnector"
+        ) as imap_cls:
+            connector._try_smtp_send(
+                seed="reply", seed_id="orig@id", seed_mailbox="INBOX",
+                send_now=True, from_account="Gmail", to=None, cc=None, bcc=None,
+                subject=None, body="thanks", reply_all=False,
+                attachment_paths=None,
+            )
+        imap_cls.return_value.append_sent_copy.assert_called_once()
+        _args, kwargs = imap_cls.return_value.append_sent_copy.call_args
+        assert kwargs.get("answered") is True
+
+    def test_forward_send_sent_copy_not_answered(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A forward is not a reply, so its Sent copy is not \\Answered."""
+        self._configure_smtp_without_sent_stub(connector, monkeypatch)
+        monkeypatch.setattr(
+            connector,
+            "_build_reply_forward_mime",
+            lambda **kw: ("<m@id>", b"rawfwd", ["dest@example.net"]),
+        )
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender"), patch(
+            "apple_mail_fast_mcp.mail_connector.ImapConnector"
+        ) as imap_cls:
+            connector._try_smtp_send(
+                seed="forward", seed_id="orig@id", seed_mailbox="INBOX",
+                send_now=True, from_account="Gmail", to=["dest@example.net"],
+                cc=None, bcc=None, subject=None, body="fyi", reply_all=False,
+                attachment_paths=None,
+            )
+        _args, kwargs = imap_cls.return_value.append_sent_copy.call_args
+        assert kwargs.get("answered") is False
+
+    def test_sent_copy_failure_is_swallowed_and_no_applescript_fallback(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#406 hard rule: the message is already delivered when the Sent-copy
+        APPEND runs, so a failure there must be swallowed (logged, not raised)
+        and must NOT trigger the AppleScript ``tell theMessage to send``
+        fallback — that would deliver a duplicate (the PR #404 double-send
+        class of bug). The send result is still the normal success dict."""
+        self._configure_smtp_without_sent_stub(connector, monkeypatch)
+        scripts: list[str] = []
+        monkeypatch.setattr(
+            connector, "_run_applescript", lambda s: scripts.append(s) or "SENT"
+        )
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender"), patch(
+            "apple_mail_fast_mcp.mail_connector.ImapConnector"
+        ) as imap_cls:
+            # Sent-copy APPEND blows up hard (no Sent folder, protocol error…).
+            imap_cls.return_value.append_sent_copy.side_effect = (
+                MailMessageNotFoundError("no Sent folder")
+            )
+            result = connector.create_draft(
+                seed="new",
+                to=["a@example.com"],
+                subject="Hi",
+                body="Hello there",
+                from_account="Gmail",
+                send_now=True,
+            )
+        # The failure was swallowed: normal success dict, single SMTP send,
+        # and crucially NO AppleScript fallback send.
+        assert result == {
+            "draft_id": "",
+            "sent_message_id": "",
+            "from_account": "Gmail",
+        }
+        assert not any("tell theMessage to send" in s for s in scripts)
 
     # --- test-mode transport-boundary safety guard (#322 / #175) -----------
 
