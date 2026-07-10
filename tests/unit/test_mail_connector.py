@@ -8493,6 +8493,55 @@ class TestSmtpSendPath:
         _args, kwargs = imap_cls.return_value.append_sent_copy.call_args
         assert kwargs.get("answered") is False
 
+    def test_gmail_send_skips_sent_copy_because_gmail_auto_saves(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PR #404 re-review: Gmail's SMTP server auto-files submitted mail
+        into ``[Gmail]/Sent Mail`` server-side. Appending our own copy would
+        create a DUPLICATE in Sent, so for Gmail (and any provider flagged
+        ``smtp_saves_sent_copy``) the post-send APPEND is skipped. Verified
+        empirically against a live Gmail account during the #404 review."""
+        self._configure_smtp_without_sent_stub(
+            connector, monkeypatch, host="smtp.gmail.com", email="me@gmail.com"
+        )
+        monkeypatch.setattr(connector, "_run_applescript", lambda s: "")
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender"), patch(
+            "apple_mail_fast_mcp.mail_connector.ImapConnector"
+        ) as imap_cls:
+            connector.create_draft(
+                seed="new",
+                to=["a@example.com"],
+                subject="Hi",
+                body="Hello there",
+                from_account="Gmail",
+                send_now=True,
+            )
+        imap_cls.return_value.append_sent_copy.assert_not_called()
+
+    def test_gmail_reply_send_also_skips_sent_copy(
+        self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The Gmail skip applies to the reply/forward path too (which reuses
+        the fetch connector), not just fresh compose."""
+        self._configure_smtp_without_sent_stub(
+            connector, monkeypatch, host="smtp.gmail.com", email="me@gmail.com"
+        )
+        monkeypatch.setattr(
+            connector,
+            "_build_reply_forward_mime",
+            lambda **kw: ("<m@id>", b"rawreply", ["orig@example.net"]),
+        )
+        with patch("apple_mail_fast_mcp.mail_connector.SmtpSender"), patch(
+            "apple_mail_fast_mcp.mail_connector.ImapConnector"
+        ) as imap_cls:
+            connector._try_smtp_send(
+                seed="reply", seed_id="orig@id", seed_mailbox="INBOX",
+                send_now=True, from_account="Gmail", to=None, cc=None, bcc=None,
+                subject=None, body="thanks", reply_all=False,
+                attachment_paths=None,
+            )
+        imap_cls.return_value.append_sent_copy.assert_not_called()
+
     def test_sent_copy_failure_is_swallowed_and_no_applescript_fallback(
         self, connector: AppleMailConnector, monkeypatch: pytest.MonkeyPatch
     ) -> None:

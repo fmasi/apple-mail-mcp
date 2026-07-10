@@ -51,6 +51,7 @@ from .exceptions import (
 )
 from .imap_connector import ImapConnectionPool, ImapConnector
 from .imap_overrides import get_login_override
+from .imap_providers import detect_provider
 from .keychain import get_imap_password
 from .security import send_recipients_test_violation
 from .smtp_sender import SmtpSender
@@ -5211,7 +5212,9 @@ class AppleMailConnector:
         recipients = list(to) + list(cc or []) + list(bcc or [])
         self._smtp_send(from_account, raw, recipients, smtp_config=smtp_config)
         self._imap_clear_breaker(from_account)
-        self._save_sent_copy(from_account, raw, answered=False)
+        self._save_sent_copy(
+            from_account, raw, answered=False, smtp_config=smtp_config
+        )
         return {"draft_id": "", "sent_message_id": ""}
 
     def _send_reply_forward_via_smtp(
@@ -5258,7 +5261,11 @@ class AppleMailConnector:
         # Reuse the connector already built for the original fetch — a reply
         # carries \\Answered in Sent.
         self._save_sent_copy(
-            from_account, raw, answered=(seed == "reply"), imap=imap
+            from_account,
+            raw,
+            answered=(seed == "reply"),
+            smtp_config=smtp_config,
+            imap=imap,
         )
         return {"draft_id": "", "sent_message_id": ""}
 
@@ -5268,6 +5275,7 @@ class AppleMailConnector:
         raw_message: bytes,
         *,
         answered: bool,
+        smtp_config: tuple[str, int, str],
         imap: ImapConnector | None = None,
     ) -> None:
         """Best-effort: APPEND a copy of a just-SMTP-sent message to the
@@ -5278,6 +5286,16 @@ class AppleMailConnector:
         theMessage to send`` used to save as a side effect. This restores it,
         reusing the IMAP-APPEND infrastructure of the clean draft path
         (#245/#246/#292) via :meth:`ImapConnector.append_sent_copy`.
+
+        Provider exception (PR #404 re-review): a few providers — Gmail among
+        the ones we support — already auto-file a copy of SMTP-submitted mail
+        into Sent *server-side*. Appending our own copy there produces a
+        duplicate, so for a provider flagged ``smtp_saves_sent_copy`` we skip
+        the APPEND entirely. The provider is detected from ``smtp_config``
+        (the SMTP host / login), independent of the reused ``imap`` connector.
+        This was confirmed live against a Gmail account during the review: one
+        SMTP submission with no APPEND of our own still produced exactly one
+        Sent copy.
 
         Failure boundary (deliberate): by the time this runs the message has
         already been accepted by the server and delivered to the recipient —
@@ -5297,10 +5315,22 @@ class AppleMailConnector:
                 any ``Bcc`` header, which the Sent copy legitimately records).
             answered: True when the sent message was a reply (adds
                 ``\\Answered`` to the Sent copy).
+            smtp_config: ``(smtp_host, port, login_email)`` for the account —
+                used to detect providers that auto-save Sent copies (see
+                above) so the APPEND can be skipped for them.
             imap: An existing connector for ``from_account`` to reuse (the
                 reply/forward path already built one to fetch the original);
                 ``None`` means build one from the account's resolved config.
         """
+        smtp_host, _port, login_email = smtp_config
+        if detect_provider(smtp_host, login_email).smtp_saves_sent_copy:
+            logger.debug(
+                "Skipping Sent-copy APPEND for %r: provider auto-saves "
+                "SMTP-submitted mail to Sent server-side (an APPEND would "
+                "duplicate it). (#406)",
+                from_account,
+            )
+            return
         try:
             if imap is None:
                 host, port, email = self._resolve_imap_config(from_account)
